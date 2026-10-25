@@ -41,7 +41,7 @@ Contusion: bone contusion / bone bruise / traumatic bone-marrow edema.
 Fracture: any fracture (including avulsion, stress, osteochondral).
 """
 
-SYSTEM = (
+SYSTEM_V1 = (
     "You extract structured findings from knee MRI radiology reports written in any language. "
     "Only use what the report text says; never infer findings that are not stated. "
     "For each finding answer with exactly one of: present, absent, uncertain, not_mentioned.\n"
@@ -52,6 +52,25 @@ SYSTEM = (
     "Reply with a single JSON object only, keys exactly as listed, no other text.\n\n"
     "Finding definitions:\n" + DEFINITIONS
 )
+
+# v2: changes motivated by the gold error analysis (collateral-ligament mix-ups, 'bone marrow edema' misses,
+# hedged/mild findings, contradictory sentences). UNTESTED on the model: compare v1 vs v2 on a gold dev split
+# (`--prompt v2`, separate --out/--cache) before adopting it.
+EXTRA_RULES_V2 = (
+    "Additional rules:\n"
+    "- Judge only the findings/impression text; ignore the clinical history/indication.\n"
+    "- MCL means the MEDIAL (tibial) collateral ligament only. A lateral/fibular collateral (LCL/FCL) injury is NOT an MCL finding; "
+    "say MCL is absent only if the report says the MEDIAL collateral is intact.\n"
+    "- Contusion counts bone contusion, bone bruise and bone-marrow/bony/subchondral edema. Muscle or soft-tissue edema does NOT count.\n"
+    "- Mild, minimal, trace, small, low-grade or grade 1 findings are still present. Use uncertain only for explicit doubt "
+    "(possible, suspected, cannot be excluded) or when the report contradicts itself about that finding.\n"
+    "- Effusion includes hemarthrosis. Synovitis includes synovial thickening/hypertrophy/reaction.\n"
+    "- If one sentence says 'no fracture' (or any 'no X') and another names X, answer uncertain.\n"
+    "- Silence about a structure is not_mentioned, never absent.\n"
+)
+SYSTEM_V2 = SYSTEM_V1 + "\n" + EXTRA_RULES_V2
+SYSTEM = SYSTEM_V1            # default stays v1 so existing runs reproduce; selected by --prompt
+PROMPTS = {"v1": SYSTEM_V1, "v2": SYSTEM_V2}
 
 FEWSHOT = [
     ("Complete tear of the ACL. Horizontal tear of the posterior horn of the medial meniscus. "
@@ -100,6 +119,11 @@ def parse_json(text):
 
 
 
+def set_prompt(version):
+    global SYSTEM
+    SYSTEM = PROMPTS[version]
+
+
 def chat_prompt(tok, report):
     """Chat-template prompt. Qwen3: thinking is switched off (it would emit <think> text and waste tokens).
     Templates without a system role (e.g. Gemma 2) get the system text merged into the first user turn."""
@@ -132,7 +156,7 @@ class MockBackend:
 
 
 class HFBackend:
-    def __init__(self, model_path, load_4bit=False, max_new_tokens=260, batch_size=8):
+    def __init__(self, model_path, load_4bit=False, max_new_tokens=260, batch_size=8, temperature=0.0, seed=0):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch
@@ -146,6 +170,7 @@ class HFBackend:
             kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
         self.model = AutoModelForCausalLM.from_pretrained(model_path, **kw).eval()
         self.max_new, self.bs = max_new_tokens, batch_size
+        self.temperature, self.seed = float(temperature), int(seed)
 
     def generate(self, reports):
         outs = []
@@ -153,9 +178,13 @@ class HFBackend:
             chunk = reports[i:i + self.bs]
             prompts = [chat_prompt(self.tok, r) for r in chunk]
             enc = self.tok(prompts, return_tensors="pt", padding=True).to(self.model.device)
+            gk = dict(do_sample=False)
+            if self.temperature > 0:                      # sampled run (for vote-fraction confidence)
+                self.torch.manual_seed(self.seed + i)     # reproducible per batch
+                gk = dict(do_sample=True, temperature=self.temperature, top_p=0.95)
             with self.torch.no_grad():
-                gen = self.model.generate(**enc, max_new_tokens=self.max_new, do_sample=False,
-                                          pad_token_id=self.tok.pad_token_id)
+                gen = self.model.generate(**enc, max_new_tokens=self.max_new,
+                                          pad_token_id=self.tok.pad_token_id, **gk)
             for g in gen:
                 outs.append(self.tok.decode(g[enc["input_ids"].shape[1]:], skip_special_tokens=True))
         return outs
@@ -186,20 +215,23 @@ def make_backend(name, **kw):
     if name == "mock":
         return MockBackend()
     if name == "hf":
-        return HFBackend(kw["model_path"], kw.get("load_4bit", False), batch_size=kw.get("batch_size", 8))
+        return HFBackend(kw["model_path"], kw.get("load_4bit", False), batch_size=kw.get("batch_size", 8),
+                         temperature=kw.get("temperature", 0.0), seed=kw.get("seed", 0))
     if name == "anthropic":
         return AnthropicBackend(kw.get("model") or "claude-haiku-4-5-20251001")
     raise ValueError(name)
 
 
 # --------------------------------------------------------------------------- driver
-def run(df, backend, cache_path, chunk=32, limit=None, text_col="Report"):
+def run(df, backend, cache_path, chunk=32, limit=None, text_col="Report", retry_failed=True):
     cache_path = Path(cache_path)
     done = {}
     if cache_path.exists():
         for line in cache_path.read_text().splitlines():
             try:
                 r = json.loads(line)
+                if retry_failed and not r.get("parse_ok"):
+                    continue                      # re-label rows whose JSON failed to parse
                 done[r["StudyInstanceUID"]] = r
             except Exception:
                 pass
@@ -225,7 +257,7 @@ def run(df, backend, cache_path, chunk=32, limit=None, text_col="Report"):
         for l in LABELS:
             v = r[l] if r else "not_mentioned"
             row[f"B_{l}"] = PROB[v]
-            row[f"Bc_{l}"] = CONF[v] if r else 0.0
+            row[f"Bc_{l}"] = CONF[v] if (r and r.get("parse_ok")) else 0.0
             row[f"Bv_{l}"] = v
         rows.append(row)
     return pd.DataFrame(rows)
@@ -242,9 +274,20 @@ if __name__ == "__main__":
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--cache", default=None)
+    ap.add_argument("--prompt", default="v1", choices=list(PROMPTS), help="v1 = original; v2 = revised rules (test first)")
+    ap.add_argument("--temperature", type=float, default=0.0, help=">0 => sampled run (use with --seed, K runs)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no_retry_failed", action="store_true")
     a = ap.parse_args()
+    set_prompt(a.prompt)
     df = pd.read_csv(a.train_csv)
-    be = make_backend(a.backend, model_path=a.model_path, model=a.model, load_4bit=a.load_4bit, batch_size=a.batch_size)
-    res = run(df, be, a.cache or (a.out + ".cache.jsonl"), limit=a.limit)
+    be = make_backend(a.backend, model_path=a.model_path, model=a.model, load_4bit=a.load_4bit, batch_size=a.batch_size,
+                      temperature=a.temperature, seed=a.seed)
+    res = run(df, be, a.cache or (a.out + ".cache.jsonl"), limit=a.limit, retry_failed=not a.no_retry_failed)
     res.to_csv(a.out, index=False)
+    import hashlib
+    json.dump({"model": a.model_path or a.model, "backend": a.backend, "load_4bit": a.load_4bit, "prompt": a.prompt,
+               "prompt_sha1": hashlib.sha1(SYSTEM.encode()).hexdigest()[:12], "temperature": a.temperature,
+               "seed": a.seed, "n": len(res), "parse_failures": int((~res.B_parse_ok).sum())},
+              open(a.out + ".meta.json", "w"), indent=1)
     print("saved", a.out, res.shape, "| parse failures:", int((~res.B_parse_ok).sum()))

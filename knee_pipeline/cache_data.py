@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pydicom
 from PIL import Image
+from scipy import ndimage as ndi
 
 from common import PLANES, find_data_dir
 
@@ -67,6 +68,45 @@ def read_series(series_dir, D):
     return (np.clip((vol - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
 
 
+def _otsu(img, bins=128):
+    hist, edges = np.histogram(img, bins=bins)
+    p = hist / max(hist.sum(), 1); c = (edges[:-1] + edges[1:]) / 2
+    w0 = np.cumsum(p); w1 = 1 - w0
+    m0 = np.cumsum(p * c) / np.maximum(w0, 1e-9); mt = (p * c).sum()
+    m1 = (mt - np.cumsum(p * c)) / np.maximum(w1, 1e-9)
+    return float(c[np.argmax(w0 * w1 * (m0 - m1) ** 2)])
+
+
+def crop_box(vol, margin=0.15, min_frac=0.4, thr_scale=0.5, max_frac=0.85, center_frac=0.5):
+    """Adaptive crop box (y0, y1, x0, x1) around the bright tissue of a uint8 [D,h,w] volume.
+    Mean projection over the CENTRAL center_frac of the slices (axial series run from thigh to calf, so the outer
+    slices are much wider than the joint and would defeat the crop) -> blur -> threshold (0.5 x Otsu) -> rows/cols with enough foreground
+    -> bbox + margin. Never smaller than min_frac of the long side; if the box already covers more than
+    max_frac of the frame, the full frame is returned (no crop)."""
+    D, h, w = vol.shape
+    L = max(h, w)
+    lo_i = int(round(D * (1 - center_frac) / 2)); hi_i = max(lo_i + 1, int(round(D * (1 + center_frac) / 2)))
+    img = ndi.gaussian_filter(vol[lo_i:hi_i].astype(np.float32).mean(0), sigma=L / 100)
+    mask = img > _otsu(img) * thr_scale
+    rows = np.where(mask.sum(1) >= 0.02 * w)[0]; cols = np.where(mask.sum(0) >= 0.02 * h)[0]
+    if len(rows) < 2 or len(cols) < 2:
+        return 0, h, 0, w
+    y0, y1, x0, x1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    side = max(y1 - y0, x1 - x0) * (1 + 2 * margin)
+    side = max(side, min_frac * L)
+    if side > max_frac * L:
+        return 0, h, 0, w
+    cy, cx = (y0 + y1) / 2, (x0 + x1) / 2
+    ch, cw = min(h, side), min(w, side)
+    ya = int(round(min(max(cy - ch / 2, 0), h - ch))); xa = int(round(min(max(cx - cw / 2, 0), w - cw)))
+    return ya, ya + int(round(ch)), xa, xa + int(round(cw))
+
+
+def adaptive_crop(vol, **kw):
+    y0, y1, x0, x1 = crop_box(vol, **kw)
+    return vol[:, y0:y1, x0:x1]
+
+
 def to_square(vol, H, W):
     D, h, w = vol.shape
     s = max(h, w)
@@ -87,7 +127,7 @@ def site_proxy(series_dir):
         return "unknown"
 
 
-def process_study(root, study, rows, D=24, H=160, W=160, K=1):
+def process_study(root, study, rows, D=24, H=160, W=160, K=1, crop="none"):
     """root = folder containing <study>/<series>/ ; rows = series rows of this study.
     Returns dict(arr[S,D,H,W] uint8, present[S], plane[S], fluid[S], fat[S], site)."""
     S = len(PLANES) * K
@@ -108,6 +148,8 @@ def process_study(root, study, rows, D=24, H=160, W=160, K=1):
                 v = read_series(d, D)
                 if v is None:
                     continue
+                if crop == "adaptive":
+                    v = adaptive_crop(v)
                 arr[slot] = to_square(v, H, W)
                 present[slot] = 1; fluid[slot] = int(r.Fluid_Sensitive); fat[slot] = int(r.Fat_Suppression)
                 if site == "unknown":
@@ -118,9 +160,9 @@ def process_study(root, study, rows, D=24, H=160, W=160, K=1):
 
 
 def _work(args):
-    root, study, rows, out, D, H, W, K = args
+    root, study, rows, out, D, H, W, K, crop = args
     try:
-        r = process_study(root, study, rows, D, H, W, K)
+        r = process_study(root, study, rows, D, H, W, K, crop)
         np.save(Path(out) / f"{study}.npy", r["arr"])
         rec = dict(StudyInstanceUID=study, ok=int(r["present"].sum() > 0), site_proxy=r["site"], err="")
         for i in range(len(r["present"])):
@@ -139,6 +181,7 @@ def main():
     ap.add_argument("--D", type=int, default=24)
     ap.add_argument("--size", type=int, default=160)
     ap.add_argument("--K", type=int, default=1, help="series per plane")
+    ap.add_argument("--crop", default="none", choices=["none", "adaptive"])
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
     ap.add_argument("--limit", type=int, default=None)
     a = ap.parse_args()
@@ -149,7 +192,7 @@ def main():
     ts["n_slices"] = [len(os.listdir(root / s / e)) if (root / s / e).exists() else 0
                       for s, e in zip(ts.StudyInstanceUID, ts.SeriesInstanceUID)]
     studies = ts.StudyInstanceUID.unique().tolist()[:a.limit]
-    jobs = [(root, s, ts[ts.StudyInstanceUID == s], out, a.D, a.size, a.size, a.K) for s in studies]
+    jobs = [(root, s, ts[ts.StudyInstanceUID == s], out, a.D, a.size, a.size, a.K, a.crop) for s in studies]
     t0 = time.time(); recs = []
     with Pool(a.workers) as pool:
         for i, r in enumerate(pool.imap_unordered(_work, jobs, chunksize=2), 1):

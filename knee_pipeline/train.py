@@ -3,7 +3,9 @@
 Inputs : cache dir (from cache_data.py), labels_soft.csv (from labeler_combine.py combine)
 Outputs: <out>/fold{k}.pt (EMA weights + config), oof.csv, cv_report.json, folds.csv
 
-Validation labels: for each label, studies with y>=0.8 -> positive, y<=0.2 -> negative, others ignored.
+Validation labels: for each label, studies with ev>=0.8 -> positive, ev<=0.2 -> negative, others ignored.
+ev_<label> = y_<label> by default; with --eval_labels it is a FIXED label file (e.g. the baseline oof_all.csv), so
+training on different targets (v4/v5 calibrated labels) never changes how epochs/models are selected or scored.
 Gold studies (full human labels) are also scored separately ("gold" metrics; small n -> wide CIs).
 """
 import argparse
@@ -20,14 +22,16 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold, KFold
 from torch.utils.data import DataLoader, Dataset
 
-from common import LABELS, set_seed
+from common import LABELS, set_seed, attach_eval_labels, check_folds
 from model import EMA, KneeNet, SoftBCE
+from geom import apply_study
 
 
 # --------------------------------------------------------------------------- data
 class KneeDS(Dataset):
-    def __init__(self, df, cache_dir, K, train=False):
+    def __init__(self, df, cache_dir, K, train=False, geom=None):
         self.df, self.dir, self.K, self.train = df.reset_index(drop=True), Path(cache_dir), K, train
+        self.geom = geom                                    # {study: (codes[S], side)} from geom_table.py, or None
         self.S = 3 * K
         self.y = self.df[[f"y_{l}" for l in LABELS]].values.astype(np.float32)
         self.w = self.df[[f"w_{l}" for l in LABELS]].values.astype(np.float32)
@@ -52,7 +56,12 @@ class KneeDS(Dataset):
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
-        x = torch.from_numpy(np.load(self.dir / f"{r.StudyInstanceUID}.npy", mmap_mode="r")[:].copy()).float()
+        arr = np.load(self.dir / f"{r.StudyInstanceUID}.npy", mmap_mode="r")[:].copy()
+        if self.geom is not None and r.StudyInstanceUID in self.geom:
+            codes, side = self.geom[r.StudyInstanceUID]
+            arr = apply_study(arr, [int(r[f"plane_{j}"]) for j in range(self.S)],
+                              [int(r[f"present_{j}"]) for j in range(self.S)], codes, side)
+        x = torch.from_numpy(arr).float()
         if self.train:
             x = self.augment(x)
         pres = torch.tensor([r[f"present_{j}"] for j in range(self.S)], dtype=torch.long)
@@ -139,6 +148,9 @@ def run_epochs(model, ema, loader, val_loader, val_t, loss_fn, opt, sched, epoch
             bad += 1
             if bad >= patience:
                 print(f"{tag} early stop"); break
+    if best_state is None:                      # every epoch scored NaN (no usable validation labels): keep last EMA
+        print(f"{tag} WARNING: no valid validation score; using final EMA weights")
+        best_state = {k: v.clone() for k, v in ema.state_dict().items()}
     return best, best_state
 
 
@@ -175,7 +187,13 @@ def main():
     ap.add_argument("--min_gold_ft", type=int, default=50)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--eval_labels", default=None,
+                    help="CSV with StudyInstanceUID + y_<label> (+ optional fold) used ONLY for validation/report")
     ap.add_argument("--bootstrap", type=int, default=500)
+    ap.add_argument("--head", default="series", choices=["series", "tokens"],
+                    help="series = v5 (one pooled token per series); tokens = per-label attention over every window")
+    ap.add_argument("--geom_csv", default=None,
+                    help="geom.csv from geom_table.py: canonical orientation + right-knee mirroring applied at load time")
     a = ap.parse_args()
     set_seed(a.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,7 +203,17 @@ def main():
     lab = pd.read_csv(a.labels)
     df = lab.merge(idx, on="StudyInstanceUID")
     df = df[df.ok == 1].reset_index(drop=True)
-    print(f"studies: {len(df)} | gold: {int(df.is_gold.sum())} | sites: {df.site_proxy.nunique()}")
+    GEOM = None
+    if a.geom_csv:
+        g = pd.read_csv(a.geom_csv, dtype={"StudyInstanceUID": str}).fillna({"side": ""})
+        cc = [f"code_{j}" for j in range(3 * a.K)]
+        GEOM = {s: ([int(v) for v in c], sd) for s, c, sd in zip(g.StudyInstanceUID, g[cc].values, g.side)}
+        print(f"geometry: {len(GEOM)} studies | right knees {(g.side == 'R').mean():.1%} | side unknown {(g.side == '').mean():.1%}"
+              f" | slots left untouched {(g[cc] < 0).values.mean():.1%}")
+    print(f"head: {a.head} | canonical geometry: {GEOM is not None}")
+    df = attach_eval_labels(df, a.eval_labels)
+    print(f"studies: {len(df)} | gold: {int(df.is_gold.sum())} | sites: {df.site_proxy.nunique()} | "
+          f"eval labels: {a.eval_labels or 'same as training labels'}")
     groups = df.site_proxy.fillna("unknown")
     if groups.nunique() >= a.folds:
         splits = list(GroupKFold(n_splits=a.folds).split(df, groups=groups))
@@ -195,10 +223,11 @@ def main():
     df["fold"] = -1
     for k, (_, va) in enumerate(splits):
         df.loc[va, "fold"] = k
+    check_folds(df)
     df[["StudyInstanceUID", "fold", "site_proxy"]].to_csv(out / "folds.csv", index=False)
 
     oof = np.full((len(df), len(LABELS)), np.nan, dtype=np.float32)
-    Yall = df[[f"y_{l}" for l in LABELS]].values
+    Yall = df[[f"ev_{l}" for l in LABELS]].values          # FIXED evaluation labels
     for k, (tr, va) in enumerate(splits):
         if a.only_folds is not None and k not in a.only_folds:
             continue
@@ -208,20 +237,20 @@ def main():
         pos = (ytr > 0.5).sum(0).clip(min=1); neg = ((ytr <= 0.5).sum(0)).clip(min=1)
         pw = torch.tensor(np.clip(np.sqrt(neg / pos), 1, 10), dtype=torch.float32, device=device)
         loss_fn = SoftBCE(pw, a.smoothing).to(device)
-        model = KneeNet(a.backbone, a.pretrained, a.weights_path, train_slices=a.train_slices).to(device)
+        model = KneeNet(a.backbone, a.pretrained, a.weights_path, train_slices=a.train_slices, head=a.head).to(device)
         ema = EMA(model, 0.999)
         bb = [p for n, p in model.named_parameters() if n.startswith("enc.")]
         hd = [p for n, p in model.named_parameters() if not n.startswith("enc.")]
         opt = torch.optim.AdamW([{"params": bb, "lr": a.lr_backbone}, {"params": hd, "lr": a.lr_head}], weight_decay=a.wd)
-        tl = DataLoader(KneeDS(dtr, a.cache_dir, a.K, True), batch_size=a.bs, shuffle=True, num_workers=a.workers,
+        tl = DataLoader(KneeDS(dtr, a.cache_dir, a.K, True, geom=GEOM), batch_size=a.bs, shuffle=True, num_workers=a.workers,
                         drop_last=len(dtr) > a.bs, persistent_workers=a.workers > 0)
-        vl = DataLoader(KneeDS(dva, a.cache_dir, a.K, False), batch_size=a.bs, shuffle=False, num_workers=a.workers)
+        vl = DataLoader(KneeDS(dva, a.cache_dir, a.K, False, geom=GEOM), batch_size=a.bs, shuffle=False, num_workers=a.workers)
         steps = max(1, a.epochs * math.ceil(len(tl) / a.accum))
         sched = make_sched(opt, steps, warm=max(1, len(tl) // a.accum))
         scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
-        val_t = hard_eval_labels(dva[[f"y_{l}" for l in LABELS]].values)
+        val_t = hard_eval_labels(dva[[f"ev_{l}" for l in LABELS]].values)
         gm = dva.is_gold.values.astype(bool)
-        val_gold_t = dva[[f"y_{l}" for l in LABELS]].values[gm].astype(float) if gm.sum() > 4 else None
+        val_gold_t = dva[[f"ev_{l}" for l in LABELS]].values[gm].astype(float) if gm.sum() > 4 else None
         if val_gold_t is not None:
             # gold metric uses only gold rows: evaluate via a mask trick (NaN out non-gold)
             gt = np.full((len(dva), len(LABELS)), np.nan); gt[gm] = val_gold_t; val_gold_t = gt
@@ -233,7 +262,7 @@ def main():
         gtr = dtr[dtr.is_gold]
         if a.gold_ft_epochs > 0 and len(gtr) >= a.min_gold_ft:
             print(f"[f{k}] gold fine-tune on {len(gtr)} studies")
-            gl = DataLoader(KneeDS(gtr, a.cache_dir, a.K, True), batch_size=a.bs, shuffle=True, num_workers=a.workers)
+            gl = DataLoader(KneeDS(gtr, a.cache_dir, a.K, True, geom=GEOM), batch_size=a.bs, shuffle=True, num_workers=a.workers)
             opt2 = torch.optim.AdamW(model.parameters(), lr=a.lr_backbone * 0.2, weight_decay=a.wd)
             sch2 = make_sched(opt2, a.gold_ft_epochs * len(gl), 1)
             ema2 = EMA(model, 0.9)
@@ -243,14 +272,14 @@ def main():
                 model.load_state_dict(st2)
         oof[va] = predict(model, vl, device)
         torch.save({"state": model.state_dict(), "backbone": a.backbone, "K": a.K,
-                    "train_slices": a.train_slices}, out / f"fold{k}.pt")
+                    "train_slices": a.train_slices, "head": a.head, "canon": GEOM is not None}, out / f"fold{k}.pt")
         del model, opt, tl, vl
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     # ---------------- CV report
     done = ~np.isnan(oof[:, 0])
-    rep = {"n_studies_scored": int(done.sum())}
+    rep = {"n_studies_scored": int(done.sum()), "eval_labels": a.eval_labels}
     T = hard_eval_labels(Yall)
     Tg = np.full_like(T, np.nan); gm = df.is_gold.values.astype(bool); Tg[gm] = Yall[gm]
     for name, tt in (("labels", T), ("gold", Tg)):
@@ -269,7 +298,7 @@ def main():
     rep["worst_site_macro_auc"] = float(min(vals)) if vals else None
     o = df[["StudyInstanceUID", "fold", "site_proxy", "is_gold"]].copy()
     for i, l in enumerate(LABELS):
-        o[f"p_{l}"] = oof[:, i]; o[f"y_{l}"] = Yall[:, i]
+        o[f"p_{l}"] = oof[:, i]; o[f"y_{l}"] = Yall[:, i]; o[f"ytrain_{l}"] = df[f"y_{l}"].values
     o.to_csv(out / "oof.csv", index=False)
     (out / "cv_report.json").write_text(json.dumps(rep, indent=2, default=float))
     print("\nCV macro-AUC (labels):", rep["labels"]["macro_auc"], "| gold:", rep["gold"]["macro_auc"],
