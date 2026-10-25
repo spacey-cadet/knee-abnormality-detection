@@ -1,0 +1,16 @@
+{
+  "n_train_studies": 4407,
+  "n_train_series": 24371,
+  "n_test_example_studies": 3,
+  "n_gold": 58,
+  "n_partial": 0,
+  "n_no_labels": 4349,
+  "total_train_slices": 819078,
+  "median_slices": 30.0,
+  "site_proxy_groups": 58,
+  "languages": {
+    "latin": 3866,
+    "greek": 321,
+    "cyrillic": 220
+  }
+}

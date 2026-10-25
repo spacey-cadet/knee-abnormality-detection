@@ -1,0 +1,2 @@
+TS_name,count,mean,50%,max,est_min_for_full_train_slices
+Explicit VR Little Endian,300.0,0.007828430393331018,0.005954111499988812,0.05078574999998864,6.679265739279983
