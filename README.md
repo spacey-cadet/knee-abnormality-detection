@@ -4,7 +4,7 @@ Multimodal pipeline for the Kaggle **RSNA Knee Abnormality Detection** competiti
 
 > **Research code. Not a medical device, not validated for clinical use, and not medical advice.**
 
-**Status:**  "Competition closed 22 Oct 2026. Final public score: 0.899, private score: 0/912, rank: 41292."`
+**Status:**  "Competition closed 22 Oct 2026. Final public score: 0.899, private score: 0/912, rank: 4192."`
 
 ---
 
